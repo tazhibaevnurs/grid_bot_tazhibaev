@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Grid Bot · Дашборд</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <div id="dry-run-banner" class="banner hidden">
+    ДЕМО-РЕЖИМ (DRY_RUN) — реальные ордера НЕ отправляются
+  </div>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">▚▚</span>
+      <span>GRID BOT · DASHBOARD</span>
+    </div>
+    <div class="status-pill" id="status-pill">
+      <span class="dot" id="status-dot"></span>
+      <span id="status-text">—</span>
+    </div>
+  </header>
+
+  <main>
+    <!-- Карточки -->
+    <section class="cards" id="cards">
+      <div class="card">
+        <div class="card-label">Текущая equity</div>
+        <div class="card-value mono" id="card-equity">—</div>
+        <div class="card-sub mono" id="card-equity-sub">старт: —</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Общий P&amp;L</div>
+        <div class="card-value mono" id="card-pnl">—</div>
+        <div class="card-sub mono" id="card-pnl-pct">—</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Win rate</div>
+        <div class="card-value mono" id="card-winrate">—</div>
+        <div class="card-sub mono" id="card-winrate-sub">закрытых: —</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Всего сделок</div>
+        <div class="card-value mono" id="card-trades">—</div>
+        <div class="card-sub mono" id="card-realized">реализ. P&amp;L: —</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Просадка от пика</div>
+        <div class="card-value mono" id="card-drawdown">—</div>
+        <div class="card-sub mono" id="card-peak">пик: —</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Режим</div>
+        <div class="card-value mono" id="card-mode">—</div>
+        <div class="card-sub mono" id="card-leverage">—</div>
+      </div>
+    </section>
+
+    <!-- Процессы -->
+    <section class="panel" id="processes-panel">
+      <div class="panel-head"><h2>Процессы</h2></div>
+      <div class="processes-grid" id="processes-grid"></div>
+    </section>
+
+    <!-- График equity -->
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Equity curve</h2>
+        <div class="range-switch" id="range-switch">
+          <button data-range="24h">24ч</button>
+          <button data-range="7d">7д</button>
+          <button data-range="all" class="active">Всё время</button>
+        </div>
+      </div>
+      <div class="chart-wrap">
+        <canvas id="equity-chart"></canvas>
+      </div>
+    </section>
+
+    <!-- Активные тикеры -->
+    <section class="panel" id="active-symbols-panel">
+      <div class="panel-head">
+        <h2>Активные тикеры</h2>
+        <div class="cat-breakdown mono" id="cat-breakdown"></div>
+      </div>
+      <div class="table-wrap">
+        <table id="symbols-table">
+          <thead>
+            <tr>
+              <th>Символ</th>
+              <th>Категория</th>
+              <th>Старт</th>
+              <th>Equity</th>
+              <th>P&amp;L</th>
+              <th>P&amp;L %</th>
+              <th>Сделок</th>
+              <th>Статус</th>
+            </tr>
+          </thead>
+          <tbody id="symbols-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <div class="two-col">
+      <!-- Транзакции -->
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Транзакции</h2>
+          <div class="filters">
+            <select id="filter-side">
+              <option value="">все стороны</option>
+              <option value="buy">buy</option>
+              <option value="sell">sell</option>
+            </select>
+            <input type="date" id="filter-from" title="с даты" />
+            <input type="date" id="filter-to" title="по дату" />
+            <button id="filter-apply">Фильтр</button>
+            <button id="filter-reset">Сброс</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table id="trades-table">
+            <thead>
+              <tr>
+                <th data-sort="timestamp">Время</th>
+                <th data-sort="side">Сторона</th>
+                <th data-sort="price">Цена</th>
+                <th data-sort="amount">Объём</th>
+                <th data-sort="quote_value">Сумма</th>
+                <th data-sort="realized_pnl">P&amp;L</th>
+                <th data-sort="dry_run">Статус</th>
+              </tr>
+            </thead>
+            <tbody id="trades-body"></tbody>
+          </table>
+        </div>
+        <div class="pager">
+          <button id="page-prev">‹ Назад</button>
+          <span class="mono" id="page-info">—</span>
+          <button id="page-next">Вперёд ›</button>
+        </div>
+      </section>
+
+      <!-- События -->
+      <section class="panel">
+        <div class="panel-head"><h2>События</h2></div>
+        <div class="events-wrap">
+          <ul id="events-list"></ul>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <footer class="footer mono">
+    Локальный дашборд · только 127.0.0.1 · обновление каждые
+    <span id="refresh-secs">7</span>с ·
+    <span id="last-update">—</span>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

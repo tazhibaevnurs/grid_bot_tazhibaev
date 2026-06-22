@@ -136,6 +136,20 @@ def test_per_symbol_equity_snapshots(storage):
     assert bounds["current_equity"] == pytest.approx(650.0)
 
 
+def test_control_settings(storage):
+    assert storage.get_control("risk_profile") is None
+    assert storage.get_control("risk_profile", "balanced") == "balanced"
+    storage.set_control("risk_profile", "aggressive")
+    storage.set_control("max_symbols", "10")
+    assert storage.get_control("risk_profile") == "aggressive"
+    # upsert обновляет значение.
+    storage.set_control("risk_profile", "conservative")
+    assert storage.get_control("risk_profile") == "conservative"
+    controls = storage.get_controls()
+    assert controls["max_symbols"] == "10"
+    assert controls["risk_profile"] == "conservative"
+
+
 def test_universe_history_and_current(storage):
     storage.record_universe_change("BTC/USDT", "volume", "added")
     storage.record_universe_change("ETH/USDT", "gainer", "added")

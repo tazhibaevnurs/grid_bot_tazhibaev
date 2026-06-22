@@ -88,6 +88,12 @@ class Storage:
                     last_heartbeat TEXT    NOT NULL,
                     detail         TEXT
                 );
+
+                CREATE TABLE IF NOT EXISTS control (
+                    key        TEXT PRIMARY KEY,
+                    value      TEXT,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
             # Миграции колонок ДО создания индексов, которые на них ссылаются
@@ -282,6 +288,38 @@ class Storage:
                 "SELECT * FROM processes ORDER BY name ASC"
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # --- управляющие настройки (пульт дашборда) --------------------------
+
+    def set_control(self, key: str, value: Optional[str]) -> None:
+        """Сохранить управляющую настройку (key-value), которую читает бот."""
+        ts = utc_now_iso()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO control (key, value, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value,
+                    updated_at=excluded.updated_at
+                """,
+                (key, value, ts),
+            )
+            self._conn.commit()
+
+    def get_control(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        """Прочитать одну управляющую настройку."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM control WHERE key = ?", (key,)
+            ).fetchone()
+        if row is None or row["value"] is None:
+            return default
+        return row["value"]
+
+    def get_controls(self) -> Dict[str, str]:
+        """Все управляющие настройки как словарь ``{key: value}``."""
+        with self._lock:
+            rows = self._conn.execute("SELECT key, value FROM control").fetchall()
+        return {r["key"]: r["value"] for r in rows if r["value"] is not None}
 
     # --- чтение -----------------------------------------------------------
 

@@ -379,6 +379,153 @@ function escapeHtml(s) {
   return div.innerHTML;
 }
 
+// --- пульт управления ------------------------------------------------------
+
+// Пока пользователь крутит контролы, не перетираем их фоновым обновлением.
+let controlDirty = false;
+let controlStatusTimer = null;
+
+async function postJSON(url) {
+  const res = await fetch(url, { method: "POST" });
+  let data = {};
+  try { data = await res.json(); } catch (e) {}
+  if (!res.ok) data.ok = false;
+  return data;
+}
+
+function showControlStatus(msg, ok = true) {
+  const el = document.getElementById("control-status");
+  if (!el) return;
+  el.textContent = msg;
+  el.style.color = ok ? "var(--accent)" : "var(--red)";
+  if (controlStatusTimer) clearTimeout(controlStatusTimer);
+  controlStatusTimer = setTimeout(() => { el.textContent = ""; }, 6000);
+}
+
+async function loadControl() {
+  if (controlDirty) return; // не мешаем пользователю редактировать
+  let data;
+  try {
+    data = await getJSON("/api/control");
+  } catch (e) {
+    return;
+  }
+  const s = data.settings;
+
+  const symInput = document.getElementById("sym-count");
+  if (document.activeElement !== symInput) symInput.value = s.max_symbols;
+
+  const levInput = document.getElementById("lev-count");
+  if (document.activeElement !== levInput) levInput.value = s.leverage > 1 ? s.leverage : 2;
+
+  // Тумблер рынка.
+  document.querySelectorAll("#market-toggle button").forEach((b) => {
+    b.classList.toggle("active", b.dataset.market === s.market_type);
+  });
+  document.getElementById("leverage-row").style.display =
+    s.market_type === "futures" ? "flex" : "none";
+
+  // Профили стратегии.
+  const optsEl = document.getElementById("strategy-options");
+  if (!optsEl.dataset.rendered) {
+    optsEl.innerHTML = data.profiles
+      .map(
+        (p) => `<button class="strategy-opt" data-profile="${p.id}">
+          <div class="so-label">${escapeHtml(p.label)}</div>
+          <div class="so-desc">${escapeHtml(p.description)}</div>
+        </button>`
+      )
+      .join("");
+    optsEl.dataset.rendered = "1";
+    optsEl.querySelectorAll(".strategy-opt").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        optsEl.querySelectorAll(".strategy-opt").forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        controlDirty = true;
+      });
+    });
+  }
+  optsEl.querySelectorAll(".strategy-opt").forEach((b) => {
+    b.classList.toggle("active", b.dataset.profile === s.risk_profile);
+  });
+
+  // Кнопки процесса по статусу бота.
+  const running = s.bot_status === "running" || s.bot_status === "stale";
+  document.getElementById("bot-start").disabled = running;
+  document.getElementById("bot-stop").disabled = !running;
+}
+
+function setupControlPanel() {
+  const symInput = document.getElementById("sym-count");
+  document.getElementById("sym-minus").addEventListener("click", () => {
+    symInput.value = Math.max(1, (parseInt(symInput.value, 10) || 8) - 1);
+    controlDirty = true;
+  });
+  document.getElementById("sym-plus").addEventListener("click", () => {
+    symInput.value = Math.min(30, (parseInt(symInput.value, 10) || 8) + 1);
+    controlDirty = true;
+  });
+  symInput.addEventListener("input", () => { controlDirty = true; });
+
+  document.getElementById("sym-apply").addEventListener("click", async () => {
+    const n = Math.max(1, Math.min(30, parseInt(symInput.value, 10) || 8));
+    const r = await postJSON(`/api/control/symbols?count=${n}`);
+    showControlStatus(r.message || "Готово", r.ok !== false);
+    controlDirty = false;
+    refreshAll();
+  });
+
+  document.getElementById("rescan-now").addEventListener("click", async () => {
+    const n = Math.max(1, Math.min(30, parseInt(symInput.value, 10) || 8));
+    const r = await postJSON(`/api/control/symbols?count=${n}`);
+    showControlStatus("Пересканирование запрошено.", r.ok !== false);
+    controlDirty = false;
+  });
+
+  // Тумблер рынка.
+  document.querySelectorAll("#market-toggle button").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll("#market-toggle button").forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      document.getElementById("leverage-row").style.display =
+        btn.dataset.market === "futures" ? "flex" : "none";
+      controlDirty = true;
+    });
+  });
+  document.getElementById("lev-count").addEventListener("input", () => { controlDirty = true; });
+
+  document.getElementById("market-apply").addEventListener("click", async () => {
+    const market = document.querySelector("#market-toggle button.active").dataset.market;
+    const lev = Math.max(1, Math.min(50, parseInt(document.getElementById("lev-count").value, 10) || 2));
+    showControlStatus("Переключение рынка, перезапуск бота...");
+    const r = await postJSON(`/api/control/market?market_type=${market}&leverage=${lev}`);
+    showControlStatus(r.message || "Готово", r.ok !== false);
+    controlDirty = false;
+    setTimeout(refreshAll, 1500);
+  });
+
+  document.getElementById("strategy-apply").addEventListener("click", async () => {
+    const active = document.querySelector(".strategy-opt.active");
+    if (!active) { showControlStatus("Выберите профиль", false); return; }
+    showControlStatus("Смена стратегии, перезапуск бота...");
+    const r = await postJSON(`/api/control/strategy?profile=${active.dataset.profile}`);
+    showControlStatus(r.message || "Готово", r.ok !== false);
+    controlDirty = false;
+    setTimeout(refreshAll, 1500);
+  });
+
+  // Процесс бота.
+  const botAction = async (action) => {
+    showControlStatus("Выполняется: " + action + "...");
+    const r = await postJSON(`/api/bot/${action}`);
+    showControlStatus(r.message || "Готово", r.ok !== false);
+    setTimeout(refreshAll, 1500);
+  };
+  document.getElementById("bot-start").addEventListener("click", () => botAction("start"));
+  document.getElementById("bot-stop").addEventListener("click", () => botAction("stop"));
+  document.getElementById("bot-restart").addEventListener("click", () => botAction("restart"));
+}
+
 // --- refresh / события UI ---------------------------------------------------
 
 async function refreshAll() {
@@ -386,6 +533,7 @@ async function refreshAll() {
     loadStats(),
     loadEquity(),
     loadActiveSymbols(),
+    loadControl(),
     loadTrades(),
     loadEvents(),
   ]);
@@ -453,5 +601,6 @@ function setupUI() {
 }
 
 setupUI();
+setupControlPanel();
 refreshAll();
 setInterval(refreshAll, REFRESH_MS);

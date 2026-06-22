@@ -45,6 +45,7 @@ from .orders import DryRunExecutor, LiveExecutor, OrderExecutor, PlacedOrder
 from .risk import DrawdownKillSwitch, warn_liquidation_risk
 from .screener import build_universe
 from .storage import Storage
+from .strategy import refresh_universe_fields
 
 logger = get_logger("bot")
 
@@ -377,6 +378,16 @@ class GridBot:
             self.storage.record_event("warning", "Стартовый портфель пуст (нет подходящих тикеров).")
             return
 
+        # Сброс состава от прошлой сессии: символы, которых нет в новом портфеле
+        # (например, после смены spot<->futures или профиля), помечаем removed —
+        # иначе они «зависают» в активных на дашборде между перезапусками.
+        stale = self.storage.current_universe()
+        for old_symbol, meta in stale.items():
+            if old_symbol not in universe:
+                self.storage.record_universe_change(
+                    old_symbol, meta.get("category", "manual"), "removed"
+                )
+
         weights = {sym: self._category_weight(cat) for sym, cat in universe.items()}
         allocation = allocate_capital_by_weights(weights, self.config.total_capital)
 
@@ -398,6 +409,11 @@ class GridBot:
     def _rescan(self) -> None:
         """Пересобрать портфель: убрать выпавшие, добавить новые символы."""
         logger.info("Ресканирование портфеля...")
+        # Живое применение настройки «количество символов» с дашборда:
+        # обновляем только поля состава портфеля, не трогая риск-параметры
+        # уже работающих символов.
+        if self.config.multi_symbol_mode:
+            self.config = refresh_universe_fields(self.config, self.storage.get_controls())
         try:
             new_universe = self._build_universe_map()
         except Exception as exc:  # noqa: BLE001
@@ -557,11 +573,15 @@ class GridBot:
             self.instances.pop(symbol, None)
 
     def _maybe_rescan(self) -> None:
-        """Рескан не чаще RESCAN_INTERVAL_HOURS (только мультирежим)."""
+        """Рескан по таймеру RESCAN_INTERVAL_HOURS или по запросу с дашборда."""
         if not self.config.multi_symbol_mode:
             return
+        # Кнопка «пересканировать сейчас» на дашборде ставит флаг rescan_now=1.
+        force = self.storage.get_control("rescan_now") == "1"
         interval_sec = self.config.rescan_interval_hours * 3600.0
-        if time.monotonic() - self._last_rescan_monotonic >= interval_sec:
+        if force or (time.monotonic() - self._last_rescan_monotonic >= interval_sec):
+            if force:
+                self.storage.set_control("rescan_now", "0")
             self._rescan()
             self._last_rescan_monotonic = time.monotonic()
 

@@ -225,3 +225,57 @@ tbody tr:hover { background: var(--bg-elev); }
 }
 
 .sort-arrow { font-size: 10px; opacity: 0.7; }
+
+/* ----- Пульт управления ботом ----- */
+.control-bot-buttons { display: flex; gap: 8px; }
+
+.btn {
+  cursor: pointer; border-radius: 6px; padding: 7px 12px; font-size: 13px;
+  border: 1px solid var(--border); background: var(--bg-elev); color: var(--text);
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+.btn:hover { border-color: var(--accent); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-ghost { background: transparent; }
+.btn-accent { background: rgba(45,212,191,0.14); border-color: var(--accent); color: var(--accent); font-weight: 600; }
+.btn-accent:hover { background: rgba(45,212,191,0.24); }
+.btn-step { width: 34px; padding: 7px 0; font-size: 16px; line-height: 1; }
+
+.control-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 14px; padding: 16px;
+}
+.control-block {
+  display: flex; flex-direction: column; gap: 10px;
+  background: var(--bg-elev); border: 1px solid var(--border);
+  border-radius: 8px; padding: 14px;
+}
+.control-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-dim); }
+.control-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.control-num {
+  width: 70px; text-align: center; padding: 7px; border-radius: 6px;
+  background: var(--bg); border: 1px solid var(--border); color: var(--text); font-size: 14px;
+}
+.control-hint { font-size: 11px; color: var(--text-dim); }
+.control-hint.warn { color: var(--amber); }
+
+.toggle { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.toggle button {
+  cursor: pointer; padding: 8px 16px; font-size: 13px; font-weight: 600;
+  background: transparent; color: var(--text-dim); border: none;
+}
+.toggle button.active { background: rgba(45,212,191,0.16); color: var(--accent); }
+
+.strategy-options { display: flex; flex-direction: column; gap: 8px; }
+.strategy-opt {
+  cursor: pointer; text-align: left; padding: 10px 12px; border-radius: 6px;
+  background: var(--bg); border: 1px solid var(--border); color: var(--text);
+}
+.strategy-opt:hover { border-color: var(--accent); }
+.strategy-opt.active { border-color: var(--accent); background: rgba(45,212,191,0.10); }
+.strategy-opt .so-label { font-weight: 600; font-size: 13px; }
+.strategy-opt .so-desc { font-size: 11px; color: var(--text-dim); margin-top: 3px; }
+
+.control-status {
+  padding: 0 16px 14px; font-size: 12px; color: var(--accent); min-height: 16px;
+}

@@ -64,6 +64,60 @@
       <div class="processes-grid" id="processes-grid"></div>
     </section>
 
+    <!-- Пульт управления -->
+    <section class="panel" id="control-panel">
+      <div class="panel-head">
+        <h2>Управление ботом</h2>
+        <div class="control-bot-buttons">
+          <button id="bot-start" class="btn btn-ghost">Старт</button>
+          <button id="bot-stop" class="btn btn-ghost">Стоп</button>
+          <button id="bot-restart" class="btn btn-ghost">Перезапуск</button>
+        </div>
+      </div>
+
+      <div class="control-grid">
+        <!-- Количество символов -->
+        <div class="control-block">
+          <div class="control-title">Количество символов</div>
+          <div class="control-row">
+            <button class="btn btn-step" id="sym-minus">−</button>
+            <input type="number" id="sym-count" class="control-num mono" min="1" max="30" value="8" />
+            <button class="btn btn-step" id="sym-plus">+</button>
+            <button class="btn btn-accent" id="sym-apply">Применить</button>
+          </div>
+          <div class="control-hint">Применяется при пересканировании портфеля.</div>
+          <button class="btn btn-ghost" id="rescan-now">Пересканировать сейчас</button>
+        </div>
+
+        <!-- Рынок spot/futures -->
+        <div class="control-block">
+          <div class="control-title">Рынок</div>
+          <div class="control-row">
+            <div class="toggle" id="market-toggle">
+              <button data-market="spot" class="active">SPOT</button>
+              <button data-market="futures">FUTURES</button>
+            </div>
+          </div>
+          <div class="control-row" id="leverage-row">
+            <label class="control-hint" for="lev-count">Плечо</label>
+            <input type="number" id="lev-count" class="control-num mono" min="1" max="50" value="2" />
+            <span class="control-hint">x</span>
+          </div>
+          <button class="btn btn-accent" id="market-apply">Применить (перезапуск)</button>
+          <div class="control-hint warn">Бот перезапустится автоматически (~10–15 с).</div>
+        </div>
+
+        <!-- Стратегия (профиль риска) -->
+        <div class="control-block">
+          <div class="control-title">Стратегия (риск / доходность)</div>
+          <div class="strategy-options" id="strategy-options"></div>
+          <button class="btn btn-accent" id="strategy-apply">Применить (перезапуск)</button>
+          <div class="control-hint warn">Бот перезапустится автоматически (~10–15 с).</div>
+        </div>
+      </div>
+      <div class="control-status mono" id="control-status"></div>
+    </section>
+
     <!-- График equity -->
     <section class="panel">
       <div class="panel-head">

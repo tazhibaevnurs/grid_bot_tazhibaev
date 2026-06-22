@@ -12,6 +12,10 @@
 from __future__ import annotations
 
 import os
+import signal
+import subprocess
+import sys
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,8 +26,13 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from grid_bot.storage import DEFAULT_DB_PATH, Storage
+from grid_bot.strategy import DEFAULT_PROFILE, RISK_PROFILES
 
 from .pnl import compute_fifo_pnl
+
+# Корень проекта (на уровень выше web/) — нужен для запуска бота как процесса.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+BOT_LOG_PATH = PROJECT_ROOT / "bot_run.log"
 
 # Путь к базе можно переопределить переменной окружения (по умолчанию bot_data.db).
 DB_PATH = os.getenv("GRID_BOT_DB", DEFAULT_DB_PATH)
@@ -348,6 +357,208 @@ def get_active_symbols() -> JSONResponse:
 def get_universe_history(limit: int = Query(100, ge=1, le=1000)) -> JSONResponse:
     """История изменений состава портфеля (added/wind_down/removed)."""
     return JSONResponse({"universe": storage.get_universe_history(limit=limit)})
+
+
+# ---------------------------------------------------------------------------
+# Пульт управления ботом (дашборд пишет настройки в таблицу control и при
+# необходимости перезапускает процесс бота).
+# ---------------------------------------------------------------------------
+
+
+# Хэндлы запущенных процессов бота — чтобы reap'ать их (иначе остаются зомби).
+_child_procs: List[subprocess.Popen] = []
+
+
+def _reap_children() -> None:
+    """Подобрать (reap) завершившихся дочерних ботов, чтобы не плодить зомби."""
+    for proc in list(_child_procs):
+        if proc.poll() is not None:  # poll() пожинает зомби-потомка
+            _child_procs.remove(proc)
+
+
+def _bot_runtime_status() -> str:
+    """Статус процесса бота: running / stale / stopped / offline.
+
+    Если heartbeat «свежий», но процесс физически мёртв/зомби — считаем stopped.
+    """
+    _reap_children()
+    row = storage.get_process("grid_bot")
+    status = _process_runtime_status(row)
+    if status in ("running", "stale") and row and not _pid_alive(row["pid"]):
+        return "stopped"
+    return status
+
+
+def start_bot() -> Dict[str, Any]:
+    """Запустить процесс бота, если он ещё не запущен (отдельная сессия)."""
+    _reap_children()
+    if _bot_runtime_status() in ("running", "stale"):
+        return {"ok": True, "message": "Бот уже запущен."}
+    try:
+        log = open(BOT_LOG_PATH, "a")
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "grid_bot.main"],
+            cwd=str(PROJECT_ROOT),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,  # детач: переживает reload дашборда
+        )
+        _child_procs.append(proc)
+        return {"ok": True, "message": "Бот запускается."}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "message": f"Не удалось запустить бота: {exc}"}
+
+
+def stop_bot() -> Dict[str, Any]:
+    """Остановить процесс бота по PID из heartbeat (SIGTERM -> штатный shutdown)."""
+    row = storage.get_process("grid_bot")
+    if not row or _bot_runtime_status() in ("stopped", "offline"):
+        return {"ok": True, "message": "Бот не запущен."}
+    pid = row["pid"]
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        storage.mark_process_stopped("grid_bot")
+        return {"ok": True, "message": "Процесс уже завершён."}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "message": f"Не удалось остановить бота: {exc}"}
+    # Дождёмся, пока бот отметит себя остановленным (отмена ордеров и т.п.)
+    # ИЛИ пока процесс физически не исчезнет (на случай не-graceful завершения).
+    for _ in range(20):
+        time.sleep(0.25)
+        cur = storage.get_process("grid_bot")
+        if not cur or cur["status"] == "stopped":
+            break
+        if not _pid_alive(pid):
+            storage.mark_process_stopped("grid_bot")
+            break
+    return {"ok": True, "message": "Бот остановлен."}
+
+
+def _pid_alive(pid: int) -> bool:
+    """Жив ли процесс. Зомби (<defunct>) считаем мёртвым.
+
+    ``os.kill(pid, 0)`` возвращает успех и для зомби-процессов, поэтому
+    дополнительно проверяем состояние через ``ps`` — состояние ``Z`` означает,
+    что процесс уже завершился и ждёт reap родителем.
+    """
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, ValueError):
+        return False
+    except PermissionError:
+        return True
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "state=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        state = out.stdout.strip()
+        if state and state[0] == "Z":
+            return False
+    except Exception:  # noqa: BLE001 - ps недоступен -> не блокируем
+        pass
+    return True
+
+
+def restart_bot() -> Dict[str, Any]:
+    """Перезапустить бота (стоп -> старт), чтобы применить новые настройки."""
+    stop_bot()
+    time.sleep(0.5)
+    return start_bot()
+
+
+def _current_settings() -> Dict[str, Any]:
+    """Текущие управляющие настройки (с дефолтами) для UI."""
+    controls = storage.get_controls()
+    profile = controls.get("risk_profile", DEFAULT_PROFILE)
+    try:
+        max_symbols = int(controls.get("max_symbols", "8"))
+    except (TypeError, ValueError):
+        max_symbols = 8
+    market_type = controls.get("market_type", "spot")
+    try:
+        leverage = int(controls.get("leverage", "1"))
+    except (TypeError, ValueError):
+        leverage = 1
+    return {
+        "risk_profile": profile,
+        "max_symbols": max_symbols,
+        "market_type": market_type,
+        "leverage": leverage,
+        "bot_status": _bot_runtime_status(),
+    }
+
+
+@app.get("/api/control")
+def get_control() -> JSONResponse:
+    """Текущие настройки пульта + доступные профили стратегии."""
+    profiles = [
+        {
+            "id": pid,
+            "label": p["label"],
+            "description": p["description"],
+        }
+        for pid, p in RISK_PROFILES.items()
+    ]
+    return JSONResponse({"settings": _current_settings(), "profiles": profiles})
+
+
+@app.post("/api/control/symbols")
+def set_symbols(count: int = Query(..., ge=1, le=30)) -> JSONResponse:
+    """Задать число одновременно торгуемых символов (применяется при рескане)."""
+    storage.set_control("max_symbols", str(count))
+    storage.set_control("rescan_now", "1")  # применить немедленно
+    storage.record_event("info", f"Дашборд: число символов изменено на {count} (применяется при рескане).")
+    return JSONResponse({"ok": True, "message": f"Число символов = {count}. Пересканирование запрошено.", "settings": _current_settings()})
+
+
+@app.post("/api/control/strategy")
+def set_strategy(profile: str = Query(...)) -> JSONResponse:
+    """Сменить профиль стратегии (риск/доходность). Требует перезапуска бота."""
+    if profile not in RISK_PROFILES:
+        return JSONResponse({"ok": False, "message": "Неизвестный профиль."}, status_code=400)
+    storage.set_control("risk_profile", profile)
+    storage.record_event("info", f"Дашборд: профиль стратегии -> {RISK_PROFILES[profile]['label']} (перезапуск бота).")
+    result = restart_bot()
+    return JSONResponse({**result, "settings": _current_settings()})
+
+
+@app.post("/api/control/market")
+def set_market(
+    market_type: str = Query(..., pattern="^(spot|futures)$"),
+    leverage: int = Query(2, ge=1, le=50),
+) -> JSONResponse:
+    """Переключить рынок spot<->futures (с плечом). Требует перезапуска бота."""
+    storage.set_control("market_type", market_type)
+    if market_type == "futures":
+        storage.set_control("leverage", str(leverage))
+    else:
+        storage.set_control("leverage", "1")
+    storage.record_event(
+        "info",
+        f"Дашборд: рынок -> {market_type.upper()}"
+        + (f" (плечо {leverage}x)" if market_type == "futures" else "")
+        + " (перезапуск бота).",
+    )
+    result = restart_bot()
+    return JSONResponse({**result, "settings": _current_settings()})
+
+
+@app.post("/api/bot/{action}")
+def bot_action(action: str) -> JSONResponse:
+    """Управление процессом бота: start / stop / restart."""
+    if action == "start":
+        result = start_bot()
+    elif action == "stop":
+        result = stop_bot()
+    elif action == "restart":
+        result = restart_bot()
+    else:
+        return JSONResponse({"ok": False, "message": "Неизвестное действие."}, status_code=400)
+    return JSONResponse({**result, "settings": _current_settings()})
 
 
 @app.get("/")

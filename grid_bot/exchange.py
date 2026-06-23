@@ -178,28 +178,38 @@ def fetch_current_price(exchange: ccxt.Exchange, symbol: str) -> float:
 
 
 def fetch_prices(exchange: ccxt.Exchange, symbols: list[str]) -> Dict[str, float]:
-    """Получить цены для нескольких символов ОДНИМ запросом ``fetch_tickers``.
+    """Получить цены для нескольких символов.
 
-    Критично для лимитов запросов: при работе с 5-10+ символами недопустимо
-    дёргать ``fetch_ticker`` по одному на каждой итерации цикла.
-
-    :param exchange: ccxt-инстанс.
-    :param symbols: список символов в формате рынка ccxt.
-    :returns: словарь ``{symbol: price}`` только для символов с доступной ценой.
+    Сначала один батч ``fetch_tickers(symbols)``; при ошибке или пропусках —
+    деградация на ``fetch_ticker`` по одному символу (медленнее, но надёжнее).
     """
     if not symbols:
         return {}
+
+    prices: Dict[str, float] = {}
     try:
         tickers = exchange.fetch_tickers(symbols)
-    except Exception as exc:  # noqa: BLE001 - частичная деградация лучше падения
+        for symbol in symbols:
+            ticker = tickers.get(symbol)
+            if not ticker:
+                continue
+            price = _price_from_ticker(ticker)
+            if price is not None and price > 0:
+                prices[symbol] = price
+    except Exception as exc:  # noqa: BLE001
         logger.warning("Батч fetch_tickers не удался: %s", exc)
-        return {}
-    prices: Dict[str, float] = {}
-    for symbol in symbols:
-        ticker = tickers.get(symbol)
-        if not ticker:
-            continue
-        price = _price_from_ticker(ticker)
-        if price is not None and price > 0:
-            prices[symbol] = price
+
+    missing = [s for s in symbols if s not in prices]
+    if missing:
+        if prices:
+            logger.info(
+                "Батч цен: %d/%d символов — догружаем по одному.",
+                len(prices),
+                len(symbols),
+            )
+        for symbol in missing:
+            try:
+                prices[symbol] = fetch_current_price(exchange, symbol)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Не удалось получить цену %s: %s", symbol, exc)
     return prices

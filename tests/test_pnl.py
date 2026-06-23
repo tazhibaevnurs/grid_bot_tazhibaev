@@ -4,11 +4,31 @@ from __future__ import annotations
 
 import pytest
 
-from web.pnl import compute_fifo_pnl
+from web.pnl import compute_fifo_pnl, portfolio_pnl_metrics
 
 
 def _t(tid, side, price, amount, symbol="BTC/USDT"):
     return {"id": tid, "symbol": symbol, "side": side, "price": price, "amount": amount}
+
+
+def test_portfolio_pnl_metrics_uses_equity_delta():
+    pnl_abs, pnl_pct, display_eq = portfolio_pnl_metrics(10000.0, 10035.0, 20.0)
+    assert pnl_abs == pytest.approx(35.0)
+    assert pnl_pct == pytest.approx(0.35)
+    assert display_eq == pytest.approx(10035.0)
+
+
+def test_portfolio_pnl_metrics_falls_back_to_realized_when_equity_flat():
+    pnl_abs, pnl_pct, display_eq = portfolio_pnl_metrics(10000.0, 10000.0, 45.65)
+    assert pnl_abs == pytest.approx(45.65)
+    assert pnl_pct == pytest.approx(0.4565)
+    assert display_eq == pytest.approx(10045.65)
+
+
+def test_portfolio_pnl_metrics_prefers_mark_to_market_when_higher():
+    pnl_abs, _, display_eq = portfolio_pnl_metrics(10000.0, 10049.95, 45.65)
+    assert pnl_abs == pytest.approx(49.95)
+    assert display_eq == pytest.approx(10049.95)
 
 
 def test_simple_long_pair():
@@ -79,6 +99,40 @@ def test_separate_symbols_isolated():
     pnl = compute_fifo_pnl(trades)
     assert pnl[3] == pytest.approx(10.0)
     assert pnl[4] == pytest.approx(2.0)
+
+
+def test_simple_long_pair_details():
+    trades = [
+        _t(1, "buy", 100.0, 1.0),
+        _t(2, "sell", 110.0, 1.0),
+    ]
+    from web.pnl import compute_fifo_closure_details
+
+    details = compute_fifo_closure_details(trades)
+    assert details[1] is None
+    assert details[2]["realized_pnl"] == pytest.approx(10.0)
+    assert details[2]["entry_price"] == pytest.approx(100.0)
+    assert details[2]["exit_price"] == pytest.approx(110.0)
+    assert details[2]["entry_quote_value"] == pytest.approx(100.0)
+    assert details[2]["quote_value"] == pytest.approx(110.0)
+    assert details[2]["position_side"] == "long"
+    assert details[2]["entry_side"] == "buy"
+    assert details[2]["exit_side"] == "sell"
+
+
+def test_short_pair_details():
+    trades = [
+        _t(1, "sell", 100.0, 1.0),
+        _t(2, "buy", 90.0, 1.0),
+    ]
+    from web.pnl import compute_fifo_closure_details
+
+    details = compute_fifo_closure_details(trades)
+    assert details[2]["position_side"] == "short"
+    assert details[2]["entry_side"] == "sell"
+    assert details[2]["exit_side"] == "buy"
+    assert details[2]["entry_price"] == pytest.approx(100.0)
+    assert details[2]["exit_price"] == pytest.approx(90.0)
 
 
 def test_loss_is_negative():

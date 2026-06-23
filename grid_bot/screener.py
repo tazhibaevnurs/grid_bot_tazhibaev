@@ -68,6 +68,17 @@ def _is_leveraged_token(base: str, patterns: Sequence[str]) -> bool:
     return False
 
 
+def is_perpetual_futures_symbol(symbol: str) -> bool:
+    """Spot и linear perpetual проходят; dated delivery (``...:USDT-260327``) — нет.
+
+    Grid-бот торгует бессрочными контрактами (swap). Смешивание dated futures
+    с perpetual ломает батч ``fetch_tickers`` на Binance.
+    """
+    if ":" not in symbol:
+        return True
+    return "-" not in symbol.split(":", 1)[1]
+
+
 def filter_tickers(
     tickers: Mapping[str, Any],
     *,
@@ -218,6 +229,19 @@ def build_universe(exchange: ccxt.Exchange, config: Config) -> Dict[str, str]:
         min_24h_volume_usdt=config.min_24h_volume_usdt,
         exclude_symbols=config.exclude_symbols,
     )
+    if config.is_futures:
+        before = len(filtered)
+        filtered = {
+            symbol: ticker
+            for symbol, ticker in filtered.items()
+            if is_perpetual_futures_symbol(symbol)
+        }
+        dropped = before - len(filtered)
+        if dropped:
+            logger.info(
+                "Исключено %d dated futures контрактов (оставлены только perpetual).",
+                dropped,
+            )
     by_volume = top_by_volume(filtered, config.num_top_volume)
     by_gainers = top_gainers(filtered, config.num_top_gainers)
     by_volatile = top_volatility(filtered, config.num_top_volatile)

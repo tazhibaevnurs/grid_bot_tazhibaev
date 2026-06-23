@@ -8,6 +8,7 @@ from grid_bot.config import Config
 from grid_bot.screener import (
     build_universe,
     filter_tickers,
+    is_perpetual_futures_symbol,
     merge_categories,
     split_base_quote,
     ticker_volatility_pct,
@@ -58,6 +59,28 @@ def test_split_base_quote():
     assert split_base_quote("BTC/USDT") == ("BTC", "USDT")
     assert split_base_quote("BTC/USDT:USDT") == ("BTC", "USDT")
     assert split_base_quote("ETH/BTC") == ("ETH", "BTC")
+
+
+def test_is_perpetual_futures_symbol():
+    assert is_perpetual_futures_symbol("BTC/USDT") is True
+    assert is_perpetual_futures_symbol("BTC/USDT:USDT") is True
+    assert is_perpetual_futures_symbol("BTC/USDT:USDT-260327") is False
+    assert is_perpetual_futures_symbol("ETH/USDT:USDT-251226") is False
+
+
+def test_build_universe_excludes_dated_futures(sample_tickers):
+    tickers = {
+        **sample_tickers,
+        "BTC/USDT:USDT": _ticker("BTC/USDT:USDT", 800_000_000, 3.0, 105, 95, 100),
+        "BTC/USDT:USDT-260327": _ticker(
+            "BTC/USDT:USDT-260327", 900_000_000, 5.0, 106, 94, 101
+        ),
+    }
+    config = _multi_config(market_type="futures", leverage=2)
+    exchange = _FakeExchange(tickers)
+    universe = build_universe(exchange, config)
+    assert "BTC/USDT:USDT-260327" not in universe
+    assert "BTC/USDT:USDT" in universe or "BTC/USDT" in universe
 
 
 def test_filter_excludes_unwanted(sample_tickers):

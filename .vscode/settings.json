@@ -1,0 +1,20 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe",
+  "python.terminal.activateEnvironment": true,
+  "task.allowAutomaticTasks": "on",
+  "terminal.integrated.defaultProfile.windows": "Grid Bot Dev",
+  "terminal.integrated.profiles.windows": {
+    "Grid Bot Dev": {
+      "source": "PowerShell",
+      "icon": "robot",
+      "args": [
+        "-NoExit",
+        "-File",
+        "${workspaceFolder}/scripts/dev.ps1"
+      ]
+    },
+    "PowerShell": {
+      "source": "PowerShell"
+    }
+  }
+}

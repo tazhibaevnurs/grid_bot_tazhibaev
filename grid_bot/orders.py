@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import itertools
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import ccxt
@@ -148,9 +148,13 @@ class DryRunExecutor(OrderExecutor):
 class LiveExecutor(OrderExecutor):
     """Реальное исполнение через ccxt. Используется только при DRY_RUN=false.
 
-    Капитал ограничивается параметром ``total_capital`` на уровне бота
-    (см. :mod:`grid` и проверки в :mod:`bot`): сюда передаются уже
-    рассчитанные объёмы, не превышающие лимит.
+    Каждый экземпляр ведёт **локальный** учёт позиции (``quote_balance`` +
+    ``base_position``), как :class:`DryRunExecutor`, обновляя его при
+    детекте исполнения. Это даёт корректный per-symbol equity для kill switch
+    в мультитикерном режиме и не смешивает баланс всего счёта.
+
+    ``fetch_balance()`` не используется для kill switch — только опциональная
+    диагностическая сверка через :meth:`_diagnose_exchange_equity`.
     """
 
     def __init__(
@@ -163,6 +167,10 @@ class LiveExecutor(OrderExecutor):
         self.symbol = symbol
         self.total_capital = total_capital
         self._orders: Dict[str, PlacedOrder] = {}
+        self.quote_balance: float = total_capital
+        self.base_position: float = 0.0
+        self._last_valid_equity: float = total_capital
+        self._exchange_data_stale: bool = False
         logger.info(
             "LIVE исполнитель инициализирован: symbol=%s, лимит капитала=%.4f.",
             symbol,
@@ -197,29 +205,62 @@ class LiveExecutor(OrderExecutor):
         return placed
 
     def detect_fills(self, current_price: float) -> List[PlacedOrder]:
+        """Определить исполнения одним батчевым ``fetch_open_orders``.
+
+        Ордер считается исполненным, если он отслеживается ботом, но больше
+        не присутствует в списке открытых ордеров биржи.
+        """
+        if not self._orders:
+            return []
+
+        try:
+            exchange_open = self.exchange.fetch_open_orders(self.symbol)
+            self._exchange_data_stale = False
+        except Exception as exc:  # noqa: BLE001
+            self._exchange_data_stale = True
+            logger.critical(
+                "[LIVE] Не удалось получить открытые ордера для %s: %s. "
+                "Данные equity могут быть неактуальны — kill switch использует "
+                "последнее известное значение (%.4f).",
+                self.symbol,
+                exc,
+                self._last_valid_equity,
+            )
+            return []
+
+        open_ids = {
+            str(order.get("id"))
+            for order in exchange_open
+            if order.get("id") is not None
+        }
+
         filled: List[PlacedOrder] = []
         for order_id, placed in list(self._orders.items()):
-            if placed.filled:
+            if placed.filled or order_id in open_ids:
                 continue
-            try:
-                info = self.exchange.fetch_order(order_id, self.symbol)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[LIVE] Не удалось проверить ордер %s: %s", order_id, exc)
-                continue
-            status = info.get("status")
-            if status == "closed":
-                placed.filled = True
-                filled.append(placed)
-                logger.info(
-                    "[LIVE] Исполнен %s: price=%.4f amount=%.6f (id=%s)",
-                    placed.side.value,
-                    placed.price,
-                    placed.amount,
-                    order_id,
-                )
+            placed.filled = True
+            self._apply_fill(placed)
+            filled.append(placed)
+            logger.info(
+                "[LIVE] Исполнен %s: price=%.4f amount=%.6f (id=%s)",
+                placed.side.value,
+                placed.price,
+                placed.amount,
+                order_id,
+            )
+
         for placed in filled:
             self._orders.pop(placed.id, None)
         return filled
+
+    def _apply_fill(self, placed: PlacedOrder) -> None:
+        """Обновить локальную позицию при исполнении ордера."""
+        if placed.side == Side.BUY:
+            self.quote_balance -= placed.price * placed.amount
+            self.base_position += placed.amount
+        else:
+            self.quote_balance += placed.price * placed.amount
+            self.base_position -= placed.amount
 
     def cancel_all(self) -> None:
         for order_id in list(self._orders.keys()):
@@ -231,21 +272,57 @@ class LiveExecutor(OrderExecutor):
         logger.info("[LIVE] Запрошена отмена всех открытых ордеров бота.")
 
     def fetch_equity(self, current_price: float) -> float:
-        """Equity из баланса биржи, но не больше лимита капитала.
+        """Equity из локального учёта позиции (quote + base * price).
 
-        Возвращаем минимум из реального свободного капитала и заданного
-        ``total_capital`` — бот не должен «видеть» больше, чем ему выделили.
+        При сбое связи с биржей на предыдущей итерации (``detect_fills``)
+        возвращает последнее валидное значение, а не ``total_capital``.
+        """
+        if self._exchange_data_stale:
+            logger.critical(
+                "[LIVE] Equity для %s неактуальна (сбой биржи). "
+                "Kill switch использует последнее известное значение=%.4f.",
+                self.symbol,
+                self._last_valid_equity,
+            )
+            return self._last_valid_equity
+
+        equity = self.quote_balance + self.base_position * current_price
+        self._last_valid_equity = equity
+        return equity
+
+    def _diagnose_exchange_equity(self, current_price: float) -> None:
+        """Диагностика: сравнить локальный учёт с балансом биржи (только лог).
+
+        Не используется для kill switch — только для обнаружения расхождений.
         """
         try:
             balance = self.exchange.fetch_balance()
             total = balance.get("total", {})
-            # Берём котируемую валюту из символа (часть после '/').
-            quote = self.symbol.split("/")[-1].split(":")[0] if "/" in self.symbol else "USDT"
+            quote = self._quote_currency()
             quote_total = float(total.get(quote, 0.0) or 0.0)
-            return min(quote_total, self.total_capital)
+            local_equity = self.quote_balance + self.base_position * current_price
+            diff = abs(local_equity - quote_total)
+            if diff > max(1.0, local_equity * 0.01):
+                logger.warning(
+                    "[LIVE] Расхождение equity для %s: локально=%.4f, "
+                    "свободный quote на бирже=%.4f (разница=%.4f). "
+                    "Kill switch опирается на локальный учёт.",
+                    self.symbol,
+                    local_equity,
+                    quote_total,
+                    diff,
+                )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("[LIVE] Не удалось получить баланс: %s", exc)
-            return self.total_capital
+            logger.warning(
+                "[LIVE] Диагностическая сверка баланса для %s не удалась: %s",
+                self.symbol,
+                exc,
+            )
+
+    def _quote_currency(self) -> str:
+        if "/" in self.symbol:
+            return self.symbol.split("/")[-1].split(":")[0]
+        return "USDT"
 
     @property
     def open_orders(self) -> List[PlacedOrder]:

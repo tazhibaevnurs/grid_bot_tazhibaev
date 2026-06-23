@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -28,11 +29,12 @@ from fastapi.staticfiles import StaticFiles
 from grid_bot.storage import DEFAULT_DB_PATH, Storage
 from grid_bot.strategy import DEFAULT_PROFILE, RISK_PROFILES
 
-from .pnl import compute_fifo_pnl
+from .pnl import compute_fifo_closure_details, compute_fifo_pnl, portfolio_pnl_metrics
 
 # Корень проекта (на уровень выше web/) — нужен для запуска бота как процесса.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BOT_LOG_PATH = PROJECT_ROOT / "bot_run.log"
+VENV_PYTHON = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
 
 # Путь к базе можно переопределить переменной окружения (по умолчанию bot_data.db).
 DB_PATH = os.getenv("GRID_BOT_DB", DEFAULT_DB_PATH)
@@ -41,6 +43,8 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 # Если heartbeat старше этого порога — процесс считается «завис/офлайн».
 PROCESS_STALE_SECONDS = int(os.getenv("PROCESS_STALE_SECONDS", "45"))
+DASHBOARD_HEARTBEAT_INTERVAL = float(os.getenv("DASHBOARD_HEARTBEAT_INTERVAL", "10"))
+_last_dashboard_heartbeat = 0.0
 
 PROCESS_LABELS = {
     "grid_bot": "Grid Bot (main.py)",
@@ -60,7 +64,12 @@ def _heartbeat_age_seconds(last_heartbeat: str) -> float:
 
 
 def _dashboard_heartbeat() -> None:
-    """Обновить heartbeat текущего процесса дашборда."""
+    """Обновить heartbeat текущего процесса дашборда (не чаще раза в N секунд)."""
+    global _last_dashboard_heartbeat
+    now = time.time()
+    if now - _last_dashboard_heartbeat < DASHBOARD_HEARTBEAT_INTERVAL:
+        return
+    _last_dashboard_heartbeat = now
     storage.upsert_process_heartbeat(
         "dashboard",
         os.getpid(),
@@ -142,6 +151,16 @@ def get_processes_payload() -> List[Dict[str, Any]]:
 @app.get("/api/stats")
 def get_stats() -> JSONResponse:
     """Сводная статистика для карточек дашборда."""
+    try:
+        return _build_stats_response()
+    except sqlite3.OperationalError as exc:
+        return JSONResponse(
+            {"error": "database_busy", "message": str(exc)},
+            status_code=503,
+        )
+
+
+def _build_stats_response() -> JSONResponse:
     first = storage.first_equity()
     last = storage.last_equity()
     peak = storage.peak_equity()
@@ -152,16 +171,7 @@ def get_stats() -> JSONResponse:
     current_equity = last["equity"] if last else None
     quote_currency = (last or first or {}).get("quote_currency")
 
-    pnl_abs: Optional[float] = None
-    pnl_pct: Optional[float] = None
-    if start_equity is not None and current_equity is not None:
-        pnl_abs = current_equity - start_equity
-        if start_equity != 0:
-            pnl_pct = pnl_abs / start_equity * 100.0
-
     drawdown_pct: Optional[float] = None
-    if peak and current_equity is not None and peak != 0:
-        drawdown_pct = max(0.0, (peak - current_equity) / peak * 100.0)
 
     # Win rate по закрытым сделкам (с реализованным P&L).
     trades = storage.get_all_trades_chronological()
@@ -170,6 +180,14 @@ def get_stats() -> JSONResponse:
     wins = sum(1 for v in closed if v > 0)
     win_rate = (wins / len(closed) * 100.0) if closed else None
     realized_pnl_total = sum(closed) if closed else 0.0
+
+    pnl_abs, pnl_pct, display_equity = portfolio_pnl_metrics(
+        start_equity, current_equity, realized_pnl_total
+    )
+    if display_equity is not None:
+        current_equity = display_equity
+    if peak and current_equity is not None and peak != 0:
+        drawdown_pct = max(0.0, (peak - current_equity) / peak * 100.0)
 
     # Режим/плечо/dry_run берём из самой свежей сделки (ключи не хранятся!).
     last_trade = trades[-1] if trades else None
@@ -286,6 +304,33 @@ def _categories_breakdown(active_symbols: List[Dict[str, Any]]) -> List[Dict[str
     ]
 
 
+def _apply_closure_fields(
+    row: Dict[str, Any], details: Dict[int, Optional[Dict[str, Any]]]
+) -> None:
+    """Добавить в строку сделки FIFO P&L и цены входа/выхода."""
+    info = details.get(row["id"])
+    if info is None:
+        row["realized_pnl"] = None
+        row["entry_price"] = None
+        row["exit_price"] = None
+        row["closed_amount"] = None
+        row["entry_quote_value"] = None
+        row["closed_quote_value"] = None
+        row["position_side"] = None
+        row["entry_side"] = None
+        row["exit_side"] = None
+        return
+    row["realized_pnl"] = info["realized_pnl"]
+    row["entry_price"] = info["entry_price"]
+    row["exit_price"] = info["exit_price"]
+    row["closed_amount"] = info["closed_amount"]
+    row["entry_quote_value"] = info["entry_quote_value"]
+    row["closed_quote_value"] = info["quote_value"]
+    row["position_side"] = info["position_side"]
+    row["entry_side"] = info["entry_side"]
+    row["exit_side"] = info["exit_side"]
+
+
 @app.get("/api/trades")
 def get_trades(
     limit: int = Query(50, ge=1, le=1000),
@@ -299,7 +344,7 @@ def get_trades(
     # FIFO считаем по всей хронологии символа, чтобы P&L был корректным,
     # затем проставляем значение к отфильтрованной странице.
     all_chrono = storage.get_all_trades_chronological(symbol=symbol)
-    pnl_map = compute_fifo_pnl(all_chrono)
+    details = compute_fifo_closure_details(all_chrono)
 
     page = storage.get_trades(
         limit=limit,
@@ -311,7 +356,7 @@ def get_trades(
         ascending=False,
     )
     for row in page:
-        row["realized_pnl"] = pnl_map.get(row["id"])
+        _apply_closure_fields(row, details)
         row["dry_run"] = bool(row["dry_run"])
 
     total = storage.count_trades(
@@ -319,6 +364,63 @@ def get_trades(
     )
     return JSONResponse(
         {"trades": page, "total": total, "limit": limit, "offset": offset}
+    )
+
+
+@app.get("/api/recent-closures")
+def get_recent_closures(
+    limit: int = Query(30, ge=1, le=100),
+) -> JSONResponse:
+    """Последние закрытия с реализованным P&L (для live-ленты на дашборде)."""
+    all_chrono = storage.get_all_trades_chronological()
+    details = compute_fifo_closure_details(all_chrono)
+    closed_pnls = [
+        info["realized_pnl"]
+        for info in details.values()
+        if info is not None
+    ]
+    wins = sum(1 for p in closed_pnls if p > 0)
+    losses = sum(1 for p in closed_pnls if p < 0)
+    closures: List[Dict[str, Any]] = []
+    for t in reversed(all_chrono):
+        info = details.get(t["id"])
+        if info is None:
+            continue
+        closures.append(
+            {
+                "id": t["id"],
+                "timestamp": t["timestamp"],
+                "symbol": t["symbol"],
+                "side": t["side"],
+                "price": t["price"],
+                "amount": t["amount"],
+                "quote_value": t["quote_value"],
+                "realized_pnl": info["realized_pnl"],
+                "entry_price": info["entry_price"],
+                "exit_price": info["exit_price"],
+                "closed_amount": info["closed_amount"],
+                "entry_quote_value": info["entry_quote_value"],
+                "closed_quote_value": info["quote_value"],
+                "position_side": info["position_side"],
+                "entry_side": info["entry_side"],
+                "exit_side": info["exit_side"],
+                "category": t.get("category", "manual"),
+            }
+        )
+        if len(closures) >= limit:
+            break
+    session_closed = wins + losses
+    win_rate = (wins / session_closed * 100.0) if session_closed else None
+    return JSONResponse(
+        {
+            "closures": closures,
+            "summary": {
+                "wins": wins,
+                "losses": losses,
+                "win_rate": win_rate,
+                "last_closure_id": closures[0]["id"] if closures else None,
+            },
+        }
     )
 
 
@@ -389,6 +491,13 @@ def _bot_runtime_status() -> str:
     return status
 
 
+def _bot_python() -> str:
+    """Интерпретатор проекта (.venv), иначе текущий процесс."""
+    if VENV_PYTHON.is_file():
+        return str(VENV_PYTHON)
+    return sys.executable
+
+
 def start_bot() -> Dict[str, Any]:
     """Запустить процесс бота, если он ещё не запущен (отдельная сессия)."""
     _reap_children()
@@ -397,7 +506,7 @@ def start_bot() -> Dict[str, Any]:
     try:
         log = open(BOT_LOG_PATH, "a")
         proc = subprocess.Popen(
-            [sys.executable, "-m", "grid_bot.main"],
+            [_bot_python(), "-m", "grid_bot.main"],
             cwd=str(PROJECT_ROOT),
             stdout=log,
             stderr=subprocess.STDOUT,
@@ -438,10 +547,27 @@ def stop_bot() -> Dict[str, Any]:
 def _pid_alive(pid: int) -> bool:
     """Жив ли процесс. Зомби (<defunct>) считаем мёртвым.
 
-    ``os.kill(pid, 0)`` возвращает успех и для зомби-процессов, поэтому
-    дополнительно проверяем состояние через ``ps`` — состояние ``Z`` означает,
-    что процесс уже завершился и ждёт reap родителем.
+    На Unix ``os.kill(pid, 0)`` проверяет существование без сигнала; на Windows
+    signal 0 не поддерживается (WinError 87), поэтому используем OpenProcess.
     """
+    if pid is None or pid <= 0:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        if not handle:
+            return False
+        exit_code = ctypes.c_ulong()
+        alive = False
+        if ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            alive = exit_code.value == STILL_ACTIVE
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return alive
     try:
         os.kill(pid, 0)
     except (ProcessLookupError, ValueError):

@@ -502,8 +502,8 @@ class GridBot:
             detail=f"{self.config.exchange_id} активных символов={len(alive)}"
         )
         if not alive:
-            # Возможно, портфель пуст — пробуем рескан по таймеру.
-            self._maybe_rescan()
+            # Пустой портфель — рескан каждые ~60 с (не ждём 12 ч).
+            self._maybe_rescan(empty_portfolio=True)
             return
 
         prices = self._fetch_prices([inst.symbol for inst in alive])
@@ -572,13 +572,15 @@ class GridBot:
         for symbol in [s for s, i in self.instances.items() if not i.is_alive]:
             self.instances.pop(symbol, None)
 
-    def _maybe_rescan(self) -> None:
+    def _maybe_rescan(self, *, empty_portfolio: bool = False) -> None:
         """Рескан по таймеру RESCAN_INTERVAL_HOURS или по запросу с дашборда."""
         if not self.config.multi_symbol_mode:
             return
         # Кнопка «пересканировать сейчас» на дашборде ставит флаг rescan_now=1.
         force = self.storage.get_control("rescan_now") == "1"
         interval_sec = self.config.rescan_interval_hours * 3600.0
+        if empty_portfolio:
+            interval_sec = min(interval_sec, 60.0)
         if force or (time.monotonic() - self._last_rescan_monotonic >= interval_sec):
             if force:
                 self.storage.set_control("rescan_now", "0")

@@ -12,6 +12,7 @@
     ДЕМО-РЕЖИМ (DRY_RUN) — реальные ордера НЕ отправляются
   </div>
 
+  <div class="stats-sticky">
   <header class="topbar">
     <div class="brand">
       <span class="logo">▚▚</span>
@@ -23,15 +24,13 @@
     </div>
   </header>
 
-  <main>
-    <!-- Карточки -->
-    <section class="cards" id="cards">
+    <section class="cards cards-sticky" id="cards">
       <div class="card">
         <div class="card-label">Текущая equity</div>
         <div class="card-value mono" id="card-equity">—</div>
         <div class="card-sub mono" id="card-equity-sub">старт: —</div>
       </div>
-      <div class="card">
+      <div class="card card-pnl">
         <div class="card-label">Общий P&amp;L</div>
         <div class="card-value mono" id="card-pnl">—</div>
         <div class="card-sub mono" id="card-pnl-pct">—</div>
@@ -57,8 +56,28 @@
         <div class="card-sub mono" id="card-leverage">—</div>
       </div>
     </section>
+  </div>
 
-    <!-- Процессы -->
+  <div id="toast-host" class="toast-host" aria-live="polite"></div>
+
+  <main>
+    <section class="panel live-panel" id="live-pnl-panel">
+      <div class="panel-head">
+        <h2>Live · закрытия P&amp;L</h2>
+        <div class="live-head-meta mono">
+          <span class="live-dot"></span>
+          <span id="live-summary">—</span>
+        </div>
+      </div>
+      <div class="live-closures-wrap">
+        <div class="live-head-row mono">
+          <span>Время</span><span>Символ</span><span>Позиция</span>
+          <span>Сделки (вход → выход)</span><span>Размер входа</span><span>Сумма выхода</span><span>P&amp;L</span>
+        </div>
+        <ul id="live-closures" class="live-closures"></ul>
+      </div>
+    </section>
+
     <section class="panel" id="processes-panel">
       <div class="panel-head"><h2>Процессы</h2></div>
       <div class="processes-grid" id="processes-grid"></div>
@@ -180,10 +199,13 @@
             <thead>
               <tr>
                 <th data-sort="timestamp">Время</th>
-                <th data-sort="side">Сторона</th>
+                <th data-sort="symbol">Символ</th>
+                <th data-sort="position_side">Позиция</th>
+                <th data-sort="entry_price">Цены</th>
+                <th data-sort="entry_quote_value">Размер входа</th>
+                <th data-sort="closed_quote_value">Сумма выхода</th>
                 <th data-sort="price">Цена</th>
                 <th data-sort="amount">Объём</th>
-                <th data-sort="quote_value">Сумма</th>
                 <th data-sort="realized_pnl">P&amp;L</th>
                 <th data-sort="dry_run">Статус</th>
               </tr>
@@ -209,8 +231,9 @@
   </main>
 
   <footer class="footer mono">
-    Локальный дашборд · только 127.0.0.1 · обновление каждые
-    <span id="refresh-secs">7</span>с ·
+    Локальный дашборд · только 127.0.0.1 · live
+    <span id="refresh-fast-secs">2</span>с · полное
+    <span id="refresh-secs">10</span>с ·
     <span id="last-update">—</span>
   </footer>
 

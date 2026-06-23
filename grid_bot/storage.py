@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -37,7 +38,10 @@ class Storage:
 
     def _init_db(self) -> None:
         with self._lock:
+            # WAL + busy_timeout: бот и дашборд пишут/читают одну базу из разных процессов.
             self._conn.execute("PRAGMA journal_mode=WAL;")
+            self._conn.execute("PRAGMA synchronous=NORMAL;")
+            self._conn.execute("PRAGMA busy_timeout=15000;")
             self._conn.execute("PRAGMA foreign_keys=ON;")
             self._conn.executescript(
                 """
@@ -112,6 +116,26 @@ class Storage:
             )
             self._conn.commit()
 
+    def _locked_write(self, fn, *, retries: int = 8) -> Any:
+        """Выполнить запись с commit; при ``database is locked`` — короткий backoff."""
+        last_err: Optional[BaseException] = None
+        for attempt in range(retries):
+            try:
+                with self._lock:
+                    result = fn()
+                    self._conn.commit()
+                    return result
+            except sqlite3.OperationalError as exc:
+                last_err = exc
+                msg = str(exc).lower()
+                if attempt < retries - 1 and ("locked" in msg or "busy" in msg):
+                    time.sleep(0.02 * (2**attempt))
+                    continue
+                raise
+        if last_err:
+            raise last_err
+        raise RuntimeError("unreachable")
+
     def _migrate(self) -> None:
         """Лёгкие миграции для уже существующих баз (добавление новых колонок)."""
         # trades.category — для старых баз без этой колонки.
@@ -150,7 +174,8 @@ class Storage:
         """Записать исполненную сделку. ``quote_value`` считается как price*amount."""
         ts = timestamp or utc_now_iso()
         quote_value = float(price) * float(amount)
-        with self._lock:
+
+        def _insert() -> int:
             cur = self._conn.execute(
                 """
                 INSERT INTO trades
@@ -164,8 +189,9 @@ class Storage:
                     int(leverage), category,
                 ),
             )
-            self._conn.commit()
             return int(cur.lastrowid)
+
+        return self._locked_write(_insert)
 
     def record_equity_snapshot(
         self,
@@ -182,14 +208,16 @@ class Storage:
         статистики в разделе "Активные тикеры".
         """
         ts = timestamp or utc_now_iso()
-        with self._lock:
+
+        def _insert() -> int:
             cur = self._conn.execute(
                 "INSERT INTO equity_snapshots (timestamp, equity, quote_currency, symbol) "
                 "VALUES (?, ?, ?, ?)",
                 (ts, float(equity), quote_currency, symbol),
             )
-            self._conn.commit()
             return int(cur.lastrowid)
+
+        return self._locked_write(_insert)
 
     def record_universe_change(
         self,
@@ -200,14 +228,16 @@ class Storage:
     ) -> int:
         """Записать изменение состава портфеля (action: ``added`` / ``removed``)."""
         ts = timestamp or utc_now_iso()
-        with self._lock:
+
+        def _insert() -> int:
             cur = self._conn.execute(
                 "INSERT INTO universe_history (timestamp, symbol, category, action) "
                 "VALUES (?, ?, ?, ?)",
                 (ts, symbol, category, action),
             )
-            self._conn.commit()
             return int(cur.lastrowid)
+
+        return self._locked_write(_insert)
 
     def record_event(
         self,
@@ -217,13 +247,15 @@ class Storage:
     ) -> int:
         """Записать важное событие (старт/стоп, kill switch, ошибка биржи)."""
         ts = timestamp or utc_now_iso()
-        with self._lock:
+
+        def _insert() -> int:
             cur = self._conn.execute(
                 "INSERT INTO events (timestamp, level, message) VALUES (?, ?, ?)",
                 (ts, level, message),
             )
-            self._conn.commit()
             return int(cur.lastrowid)
+
+        return self._locked_write(_insert)
 
     def upsert_process_heartbeat(
         self,
@@ -236,7 +268,8 @@ class Storage:
     ) -> None:
         """Обновить heartbeat процесса (бот или дашборд) для мониторинга на UI."""
         now = timestamp or utc_now_iso()
-        with self._lock:
+
+        def _upsert() -> None:
             row = self._conn.execute(
                 "SELECT pid, started_at, status FROM processes WHERE name = ?", (name,)
             ).fetchone()
@@ -257,12 +290,14 @@ class Storage:
                 """,
                 (name, int(pid), status, started_at, now, detail),
             )
-            self._conn.commit()
+
+        self._locked_write(_upsert)
 
     def mark_process_stopped(self, name: str, *, timestamp: Optional[str] = None) -> None:
         """Пометить процесс как остановленный (при завершении бота/дашборда)."""
         now = timestamp or utc_now_iso()
-        with self._lock:
+
+        def _stop() -> None:
             self._conn.execute(
                 """
                 UPDATE processes
@@ -271,7 +306,8 @@ class Storage:
                 """,
                 (now, name),
             )
-            self._conn.commit()
+
+        self._locked_write(_stop)
 
     def get_process(self, name: str) -> Optional[Dict[str, Any]]:
         """Получить запись о процессе по имени."""
@@ -294,7 +330,8 @@ class Storage:
     def set_control(self, key: str, value: Optional[str]) -> None:
         """Сохранить управляющую настройку (key-value), которую читает бот."""
         ts = utc_now_iso()
-        with self._lock:
+
+        def _upsert() -> None:
             self._conn.execute(
                 """
                 INSERT INTO control (key, value, updated_at) VALUES (?, ?, ?)
@@ -303,7 +340,8 @@ class Storage:
                 """,
                 (key, value, ts),
             )
-            self._conn.commit()
+
+        self._locked_write(_upsert)
 
     def get_control(self, key: str, default: Optional[str] = None) -> Optional[str]:
         """Прочитать одну управляющую настройку."""

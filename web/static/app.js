@@ -1,7 +1,8 @@
 "use strict";
 
-// Локальный дашборд: обычный polling через fetch, без WebSocket.
-const REFRESH_MS = 7000;
+// Локальный дашборд: быстрый polling для сделок/P&L, медленный — для остального.
+const REFRESH_FAST_MS = 2000;
+const REFRESH_SLOW_MS = 10000;
 
 const state = {
   page: 0,
@@ -16,6 +17,39 @@ const state = {
 };
 
 let equityChart = null;
+
+const liveState = {
+  seenClosureIds: new Set(),
+  bootstrapped: false,
+  prevPnlAbs: null,
+  prevTradeIds: new Set(),
+  tradesReady: false,
+};
+
+// Не даём P&L «мигать» нулём между тиками обновления (устаревший snapshot equity).
+const metricsHold = { pnlAbs: null, pnlPct: null, equity: null };
+
+function stableMetrics(s) {
+  let pnlAbs = s.pnl_abs;
+  let pnlPct = s.pnl_pct;
+  let equity = s.current_equity;
+
+  const hasPnl = pnlAbs !== null && Math.abs(pnlAbs) >= 0.01;
+  if (hasPnl) {
+    metricsHold.pnlAbs = pnlAbs;
+    metricsHold.pnlPct = pnlPct;
+    metricsHold.equity = equity;
+  } else if (metricsHold.pnlAbs !== null && Math.abs(metricsHold.pnlAbs) >= 0.01) {
+    pnlAbs = metricsHold.pnlAbs;
+    pnlPct = metricsHold.pnlPct;
+    equity = metricsHold.equity ?? equity;
+  } else if (Math.abs(s.realized_pnl_total || 0) >= 0.01 && s.start_equity) {
+    pnlAbs = s.realized_pnl_total;
+    pnlPct = (s.realized_pnl_total / s.start_equity) * 100;
+    equity = s.start_equity + s.realized_pnl_total;
+  }
+  return { pnlAbs, pnlPct, equity };
+}
 
 // --- утилиты форматирования ------------------------------------------------
 
@@ -58,21 +92,33 @@ async function loadStats() {
   try {
     s = await getJSON("/api/stats");
   } catch (e) {
+    const dot = document.getElementById("status-dot");
+    const txt = document.getElementById("status-text");
+    dot.className = "dot stale";
+    txt.textContent = "API ERROR";
     return;
   }
 
   const cur = s.quote_currency || "";
+  const m = stableMetrics(s);
   document.getElementById("card-equity").textContent =
-    s.current_equity === null ? "—" : `${fmtNum(s.current_equity)} ${cur}`;
+    m.equity === null ? "—" : `${fmtNum(m.equity)} ${cur}`;
   document.getElementById("card-equity-sub").textContent =
     `старт: ${s.start_equity === null ? "—" : fmtNum(s.start_equity)}`;
 
   const pnlEl = document.getElementById("card-pnl");
-  pnlEl.textContent = s.pnl_abs === null ? "—" : `${fmtSigned(s.pnl_abs)} ${cur}`;
-  pnlEl.className = "card-value mono " + pnlClass(s.pnl_abs);
+  const prevPnl = liveState.prevPnlAbs;
+  pnlEl.textContent = m.pnlAbs === null ? "—" : `${fmtSigned(m.pnlAbs)} ${cur}`;
+  pnlEl.className = "card-value mono " + pnlClass(m.pnlAbs);
+  if (prevPnl !== null && m.pnlAbs !== null && Math.abs(m.pnlAbs - prevPnl) >= 0.001) {
+    pnlEl.classList.remove("flash-up", "flash-down");
+    void pnlEl.offsetWidth;
+    pnlEl.classList.add(m.pnlAbs >= prevPnl ? "flash-up" : "flash-down");
+  }
+  liveState.prevPnlAbs = m.pnlAbs;
   const pctEl = document.getElementById("card-pnl-pct");
-  pctEl.textContent = s.pnl_pct === null ? "—" : `${fmtSigned(s.pnl_pct)} %`;
-  pctEl.className = "card-sub mono " + pnlClass(s.pnl_pct);
+  pctEl.textContent = m.pnlPct === null ? "—" : `${fmtSigned(m.pnlPct)} %`;
+  pctEl.className = "card-sub mono " + pnlClass(m.pnlPct);
 
   document.getElementById("card-winrate").textContent =
     s.win_rate === null ? "—" : `${fmtNum(s.win_rate, 1)} %`;
@@ -220,6 +266,165 @@ function renderProcesses(processes) {
   }
 }
 
+async function loadLiveClosures() {
+  let data;
+  try {
+    data = await getJSON("/api/recent-closures?limit=25");
+  } catch (e) {
+    try {
+      data = await buildClosuresFromTrades(25);
+    } catch (e2) {
+      renderLiveError("Не удалось загрузить live-ленту. Перезапустите дашборд (Ctrl+C → uvicorn).");
+      return;
+    }
+  }
+  renderLiveClosures(data);
+}
+
+async function buildClosuresFromTrades(limit) {
+  const [page, stats] = await Promise.all([
+    getJSON(`/api/trades?limit=${Math.max(limit, 100)}&offset=0`),
+    getJSON("/api/stats"),
+  ]);
+  const closures = page.trades
+    .filter((t) => t.realized_pnl !== null && t.realized_pnl !== undefined)
+    .slice(0, limit);
+  const closed = stats.closed_trades || 0;
+  const wins =
+    stats.win_rate != null && closed
+      ? Math.round((stats.win_rate / 100) * closed)
+      : 0;
+  return {
+    closures,
+    summary: {
+      wins,
+      losses: Math.max(0, closed - wins),
+      win_rate: stats.win_rate,
+      last_closure_id: closures[0]?.id ?? null,
+    },
+  };
+}
+
+function renderLiveError(msg) {
+  const summaryEl = document.getElementById("live-summary");
+  if (summaryEl) summaryEl.textContent = "ошибка API";
+  const list = document.getElementById("live-closures");
+  if (list) list.innerHTML = `<li class="live-empty live-error">${escapeHtml(msg)}</li>`;
+}
+
+function fmtPrice(v) {
+  if (v === null || v === undefined || Number.isNaN(v)) return "—";
+  const n = Number(v);
+  if (n >= 1000) return fmtNum(n, 2);
+  if (n >= 1) return fmtNum(n, 4);
+  return fmtNum(n, 6);
+}
+
+function inferPositionSide(c) {
+  if (c.position_side === "long" || c.position_side === "short") return c.position_side;
+  if (c.side === "sell") return "long";
+  if (c.side === "buy") return "short";
+  return null;
+}
+
+function closurePositionTag(c) {
+  const pos = inferPositionSide(c);
+  if (pos === "long") return '<span class="tag long">LONG</span>';
+  if (pos === "short") return '<span class="tag short">SHORT</span>';
+  return "—";
+}
+
+function closureLegsText(c) {
+  if (c.entry_price == null || c.exit_price == null) return "—";
+  const pos = inferPositionSide(c);
+  const entryLeg = c.entry_side ?? (pos === "short" ? "sell" : "buy");
+  const exitLeg = c.exit_side ?? (pos === "short" ? "buy" : "sell");
+  return `${entryLeg} ${fmtPrice(c.entry_price)} → ${exitLeg} ${fmtPrice(c.exit_price)}`;
+}
+
+function closurePricesText(c) {
+  return closureLegsText(c);
+}
+
+function closureEntrySumText(c) {
+  const sum = c.entry_quote_value;
+  return sum == null ? "—" : fmtNum(sum, 2);
+}
+
+function closureExitSumText(c) {
+  const sum = c.closed_quote_value ?? c.quote_value;
+  return sum == null ? "—" : fmtNum(sum, 2);
+}
+
+function renderLiveClosures(data) {
+  const summaryEl = document.getElementById("live-summary");
+  if (summaryEl && data.summary) {
+    const s = data.summary;
+    summaryEl.innerHTML =
+      `<span class="pos">+${s.wins}</span> / <span class="neg">−${s.losses}</span>` +
+      (s.win_rate != null ? ` · win ${fmtNum(s.win_rate, 1)}%` : "");
+  }
+
+  const list = document.getElementById("live-closures");
+  if (!list) return;
+
+  list.innerHTML = "";
+  let justArrivedId = null;
+  for (const c of data.closures) {
+    if (liveState.bootstrapped && !liveState.seenClosureIds.has(c.id)) {
+      showTradeToast(c);
+      justArrivedId = c.id;
+    }
+    liveState.seenClosureIds.add(c.id);
+  }
+  liveState.bootstrapped = true;
+
+  if (!data.closures.length) {
+    list.innerHTML =
+      '<li class="live-empty">Пока нет закрытий с P&L — прибыль появляется на паре buy+sell</li>';
+    return;
+  }
+
+  for (const c of data.closures) {
+    const cls = pnlClass(c.realized_pnl);
+    const li = document.createElement("li");
+    li.className = `live-item ${cls}${c.id === justArrivedId ? " live-new" : ""}`;
+    li.innerHTML = `
+      <span class="live-time">${fmtTime(c.timestamp)}</span>
+      <span class="live-symbol">${escapeHtml(shortSymbol(c.symbol))}</span>
+      <span>${closurePositionTag(c)}</span>
+      <span class="live-prices">${closureLegsText(c)}</span>
+      <span class="live-sum">${closureEntrySumText(c)}</span>
+      <span class="live-sum">${closureExitSumText(c)}</span>
+      <span class="live-pnl ${cls}">${fmtSigned(c.realized_pnl, 4)}</span>
+    `;
+    list.appendChild(li);
+  }
+}
+
+function shortSymbol(symbol) {
+  if (!symbol) return "—";
+  return symbol.replace(":USDT", "").replace("/USDT", "");
+}
+
+function showTradeToast(c) {
+  const host = document.getElementById("toast-host");
+  if (!host) return;
+  const cls = pnlClass(c.realized_pnl);
+  const el = document.createElement("div");
+  el.className = `trade-toast ${cls}`;
+  el.innerHTML =
+    `<strong>${escapeHtml(shortSymbol(c.symbol))}</strong> ${closurePositionTag(c)} ` +
+    `${closureLegsText(c)} · вх ${closureEntrySumText(c)} → вых ${closureExitSumText(c)} · ` +
+    `<span class="${cls}">${fmtSigned(c.realized_pnl, 4)} USDT</span>`;
+  host.appendChild(el);
+  requestAnimationFrame(() => el.classList.add("show"));
+  setTimeout(() => {
+    el.classList.remove("show");
+    setTimeout(() => el.remove(), 300);
+  }, 4500);
+}
+
 // --- график equity ---------------------------------------------------------
 
 function rangeToFrom(range) {
@@ -332,17 +537,27 @@ async function loadTrades() {
   for (const t of rows) {
     const tr = document.createElement("tr");
     const pnl = t.realized_pnl;
+    const isNew = liveState.tradesReady && state.page === 0 && !liveState.prevTradeIds.has(t.id);
+    liveState.prevTradeIds.add(t.id);
+    if (pnl !== null && pnl !== undefined) {
+      tr.classList.add(pnl > 0 ? "row-win" : pnl < 0 ? "row-loss" : "");
+    }
+    if (isNew) tr.classList.add("row-new");
     tr.innerHTML = `
       <td>${fmtTime(t.timestamp)}</td>
-      <td><span class="tag ${t.side}">${t.side}</span></td>
-      <td>${fmtNum(t.price, 2)}</td>
+      <td class="sym-name">${escapeHtml(shortSymbol(t.symbol))}</td>
+      <td>${pnl === null || pnl === undefined ? `<span class="tag ${t.side}">${t.side}</span>` : closurePositionTag(t)}</td>
+      <td>${pnl === null || pnl === undefined ? "—" : closureLegsText(t)}</td>
+      <td>${pnl === null || pnl === undefined ? "—" : fmtNum(t.entry_quote_value, 2)}</td>
+      <td>${pnl === null || pnl === undefined ? "—" : fmtNum(t.closed_quote_value ?? t.quote_value, 2)}</td>
+      <td>${fmtNum(t.price, 4)}</td>
       <td>${fmtNum(t.amount, 6)}</td>
-      <td>${fmtNum(t.quote_value, 2)}</td>
       <td class="${pnlClass(pnl)}">${pnl === null || pnl === undefined ? "—" : fmtSigned(pnl, 4)}</td>
       <td><span class="tag ${t.dry_run ? "demo" : "live"}">${t.dry_run ? "demo" : "live"}</span></td>
     `;
     body.appendChild(tr);
   }
+  if (!liveState.tradesReady && rows.length) liveState.tradesReady = true;
 
   const totalPages = Math.max(1, Math.ceil(state.total / state.pageSize));
   document.getElementById("page-info").textContent =
@@ -408,6 +623,7 @@ async function loadControl() {
   try {
     data = await getJSON("/api/control");
   } catch (e) {
+    showControlStatus("Не удалось загрузить настройки: " + e.message, false);
     return;
   }
   const s = data.settings;
@@ -528,21 +744,33 @@ function setupControlPanel() {
 
 // --- refresh / события UI ---------------------------------------------------
 
-async function refreshAll() {
+async function refreshFast() {
   await Promise.allSettled([
     loadStats(),
-    loadEquity(),
-    loadActiveSymbols(),
-    loadControl(),
+    loadLiveClosures(),
     loadTrades(),
-    loadEvents(),
+    loadActiveSymbols(),
   ]);
   document.getElementById("last-update").textContent =
-    "обновлено " + new Date().toLocaleTimeString("ru-RU", { hour12: false });
+    "live " + new Date().toLocaleTimeString("ru-RU", { hour12: false });
+}
+
+async function refreshSlow() {
+  await Promise.allSettled([
+    loadEquity(),
+    loadControl(),
+    loadEvents(),
+  ]);
+}
+
+async function refreshAll() {
+  await refreshFast();
+  await refreshSlow();
 }
 
 function setupUI() {
-  document.getElementById("refresh-secs").textContent = String(REFRESH_MS / 1000);
+  document.getElementById("refresh-fast-secs").textContent = String(REFRESH_FAST_MS / 1000);
+  document.getElementById("refresh-secs").textContent = String(REFRESH_SLOW_MS / 1000);
 
   // Диапазон графика.
   document.querySelectorAll("#range-switch button").forEach((btn) => {
@@ -603,4 +831,5 @@ function setupUI() {
 setupUI();
 setupControlPanel();
 refreshAll();
-setInterval(refreshAll, REFRESH_MS);
+setInterval(refreshFast, REFRESH_FAST_MS);
+setInterval(refreshSlow, REFRESH_SLOW_MS);
